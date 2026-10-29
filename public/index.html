@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Order Agent</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">Order Agent <span class="muted">· COD only</span></div>
+    <nav>
+      <a href="#setup" data-tab="setup">Setup</a>
+      <a href="#order" data-tab="order">Order</a>
+      <a href="#dashboard" data-tab="dashboard">Admin</a>
+    </nav>
+  </header>
+
+  <main>
+    <div id="toast" class="toast" hidden></div>
+    <section id="setup" class="view"></section>
+    <section id="order" class="view" hidden></section>
+    <section id="dashboard" class="view" hidden></section>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

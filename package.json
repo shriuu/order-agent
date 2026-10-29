@@ -1,0 +1,17 @@
+{
+  "name": "order-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One setup, Swiggy + Zomato, one place to order (COD only), plus a log of where agents break.",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0"
+  }
+}
