@@ -137,8 +137,8 @@ async function withClaude(text, draft, ctx, history) {
 
 const NUMBERS = { one: 1, a: 1, an: 1, ek: 1, two: 2, do: 2, three: 3, teen: 3, four: 4, char: 4, five: 5, paanch: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
 const PLATFORM_RE = /\b(swigg?y|swiggi|zomato|zometo|zomatto)\b/i;
-const YES_RE = /^(yes|yeah|yep|haan|ha|ok(ay)?|sure|go ahead|send( it)?|confirm|do it|place it)\b/i;
-const NO_RE = /^(no|nope|cancel|stop|start over|nahi|clear)\b/i;
+export const YES_RE = /^(yes|yeah|yep|haan|ha|ok(ay)?|sure|go ahead|send( it)?|confirm|do it|place it)\b/i;
+export const NO_RE = /^(no|nope|cancel|stop|start over|nahi|clear)\b/i;
 const QUESTION_RE = /^(what|whats|what's|how|when|which|who|why|is|are|do|does|can|did|tell me|show me)\b|\?$/i;
 
 export function withRules(text, draft, ctx) {

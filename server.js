@@ -6,13 +6,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { understand, missing, emptyDraft, hasCredentials } from './agent.js';
+import OpenAI from 'openai';
+import { understand, missing, emptyDraft, hasCredentials, YES_RE, NO_RE } from './agent.js';
+import { shopTurn, openaiEnabled } from './shop.js';
+import { placeCashOrder } from './place.js';
 import { sarvamEnabled, transcribe, speak } from './sarvam.js';
 import { activityFor } from './activity.js';
+import { swiggy } from './swiggy.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DB_FILE = process.env.DB_FILE || path.join(ROOT, 'data', 'db.json');
 const PORT = Number(process.env.PORT) || 3000;
+// Where Swiggy sends the user back after login. Swiggy allows http://localhost while developing.
+const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 
 export const PLATFORMS = ['swiggy', 'zomato'];
 export const FLOWS = ['reorder', 'search', 'address_change', 'table_booking'];
@@ -75,7 +81,7 @@ function getUser(userId) {
 }
 
 const routes = {
-  'GET /api/meta': () => ({ platforms: PLATFORMS, flows: FLOWS, failures: FAILURES, settings: db.settings, agentEngine: hasCredentials() ? 'claude' : 'rules', speech: sarvamEnabled() ? 'sarvam' : 'browser', adminLocked: adminLocked() }),
+  'GET /api/meta': () => ({ platforms: PLATFORMS, flows: FLOWS, failures: FAILURES, settings: db.settings, agentEngine: openaiEnabled() ? 'openai' : hasCredentials() ? 'claude' : 'rules', speech: sarvamEnabled() ? 'sarvam' : 'browser', adminLocked: adminLocked() }),
 
   'GET /api/admin/check': () => ({ ok: true }),
 
@@ -97,13 +103,26 @@ const routes = {
 
   'GET /api/me': (_, q) => {
     const u = getUser(q.get('userId'));
-    return { user: u, links: PLATFORMS.map(p => linkFor(u.id, p) || { platform: p, status: 'not_linked' }) };
+    // Never send Swiggy tokens to the browser.
+    const pub = (l) => l ? { platform: l.platform, status: l.status, linkedAt: l.linkedAt, disconnectedAt: l.disconnectedAt, real: !!l.tokens } : null;
+    return { user: u, links: PLATFORMS.map(p => pub(linkFor(u.id, p)) || { platform: p, status: 'not_linked' }) };
   },
 
-  // Records that the user approved the official connector login in the assistant.
+  // Talks to Swiggy with the user's token and lists the tools it offers: proof the link is real.
+  'GET /api/swiggy/check': async (_, q) => {
+    const u = getUser(q.get('userId'));
+    const l = linkFor(u.id, 'swiggy');
+    need(l?.status === 'linked' && l.tokens, 'Log in with Swiggy first');
+    const client = await sw.connect(l).catch(e => { throw new HttpError(502, e.message); });
+    try { return { ok: true, tools: (await client.listTools()).tools.map(t => t.name) }; }
+    finally { await client.close().catch(() => {}); }
+  },
+
+  // Manual confirmation, only for platforms without a real login yet. Swiggy uses /oauth/swiggy/start.
   'POST /api/link': (b) => {
     const u = getUser(b.userId);
     need(PLATFORMS.includes(b.platform), 'Unknown platform');
+    need(b.platform !== 'swiggy', 'Use "Log in with Swiggy"');
     let l = linkFor(u.id, b.platform);
     if (!l) { l = { userId: u.id, platform: b.platform }; db.links.push(l); }
     Object.assign(l, { status: 'linked', linkedAt: now(), disconnectedAt: null });
@@ -116,6 +135,7 @@ const routes = {
     const l = linkFor(u.id, b.platform);
     need(l && l.status === 'linked', 'Platform is not linked');
     Object.assign(l, { status: 'disconnected', disconnectedAt: now() });
+    delete l.tokens; // forget the Swiggy login entirely
     logEvent(u.id, 'disconnect', { platform: b.platform });
     return l;
   },
@@ -139,6 +159,54 @@ const routes = {
     need(text, 'Say or type something');
     const draft = b.draft && typeof b.draft === 'object' ? { ...emptyDraft(), ...b.draft } : emptyDraft();
     const ctx = agentContext(u.id);
+
+    // Real Swiggy: ChatGPT builds an actual cart with Swiggy's tools.
+    const swLink = linkFor(u.id, 'swiggy');
+    if (openaiEnabled() && swLink?.status === 'linked' && swLink.tokens) {
+      const reset = () => sessions.delete(u.id);
+      if (draft.real && YES_RE.test(text)) {
+        const order = createOrder(u, {
+          platform: 'swiggy', flow: 'search', total: draft.total, items: describeItems(draft), lineItems: draft.items,
+          restaurant: draft.restaurant, source: 'voice', codAvailable: draft.codAvailable,
+          swiggy: { addressId: draft.addressId, addressLabel: draft.addressLabel, restaurantId: draft.restaurantId, itemTotal: draft.itemTotal, fees: draft.fees },
+        });
+        reset();
+        logEvent(u.id, 'voice', { intent: 'confirm' });
+        return {
+          intent: 'confirm', order, draft: emptyDraft(), engine: 'swiggy',
+          reply: order.status !== 'blocked' ? 'Sent. Tap approve on the Order tab when you are ready.'
+            : order.blockReason === 'cod_not_offered' ? 'Blocked: Swiggy is not offering cash on delivery for this order. I have logged it.'
+            : `Blocked: ₹${order.total} is over your ₹${order.cap} limit. I have logged it.`,
+        };
+      }
+      if (NO_RE.test(text)) { reset(); return { intent: 'cancel', draft: emptyDraft(), engine: 'swiggy', reply: 'Okay, cleared. What would you like?' }; }
+
+      let session = sessions.get(u.id);
+      if (!session || Date.now() - session.at > 30 * 60 * 1000) session = { messages: [] };
+      session.at = Date.now();
+      sessions.set(u.id, session);
+      let mcp;
+      try {
+        mcp = await sw.connect(swLink);
+        const out = await shopTurn({ text, session, mcp, ctx: { codCap: db.settings.codCap } });
+        logEvent(u.id, 'voice', { intent: 'swiggy', tools: out.toolsUsed });
+        const p = out.proposal;
+        return {
+          intent: 'order', engine: 'swiggy', reply: out.reply, toolsUsed: out.toolsUsed,
+          draft: p ? {
+            platform: 'swiggy', flow: 'search', real: true, restaurant: p.restaurantName, restaurantId: p.restaurantId,
+            items: p.items, itemTotal: p.itemTotal, fees: p.fees, total: p.total, codAvailable: p.codAvailable,
+            addressId: p.addressId, addressLabel: p.addressLabel,
+          } : draft,
+        };
+      } catch (e) {
+        console.error('Swiggy agent:', e);
+        const why = e instanceof OpenAI.APIError ? `ChatGPT error ${e.status}: ${e.message}` : e.message;
+        return { intent: 'unclear', engine: 'swiggy', draft, reply: `Sorry, something went wrong talking to Swiggy. ${why}` };
+      } finally {
+        await mcp?.close().catch(() => {});
+      }
+    }
     const out = await understand(text, draft, ctx, Array.isArray(b.history) ? b.history : []);
     logEvent(u.id, 'voice', { intent: out.intent });
 
@@ -168,7 +236,7 @@ const routes = {
     const mine = db.orders.filter(o => o.userId === u.id);
     const keyterms = [...mine.map(o => o.restaurant), ...mine.flatMap(o => (o.lineItems || []).map(i => i.name))];
     try {
-      return await transcribe(b.audio, b.mimeType, { understandsIndic: hasCredentials(), keyterms });
+      return await transcribe(b.audio, b.mimeType, { understandsIndic: hasCredentials() || openaiEnabled(), keyterms });
     } catch (e) { throw new HttpError(502, e.message); }
   },
 
@@ -202,15 +270,16 @@ const routes = {
     return db.orders.filter(o => o.userId === u.id).reverse();
   },
 
-  'POST /api/orders/decide': (b) => {
+  'POST /api/orders/decide': async (b) => {
     const o = db.orders.find(x => x.id === b.orderId && x.userId === b.userId);
     need(o, 'Order not found', 404);
     need(o.status === 'pending_approval', 'Order is not waiting for approval');
     need(['approve', 'reject'].includes(b.decision), 'Decision must be approve or reject');
-    o.status = b.decision === 'approve' ? 'approved' : 'rejected';
     o.decidedAt = now();
     logEvent(o.userId, b.decision === 'approve' ? 'order_approved' : 'order_rejected', { platform: o.platform, orderId: o.id });
-    return o;
+    if (b.decision === 'reject') { o.status = 'rejected'; return o; }
+    if (!o.swiggy) { o.status = 'approved'; return o; } // demo orders: result is recorded by hand
+    return placeOnSwiggy(o);
   },
 
   // What happened after the assistant tried to place it.
@@ -242,16 +311,51 @@ function createOrder(u, b) {
   const items = String(b.items || '').trim();
   need(items, 'Describe the order (items or restaurant)');
 
-  const blocked = b.flow === 'table_booking' ? null : capCheck(total, db.settings.codCap);
+  const overCap = b.flow === 'table_booking' ? null : capCheck(total, db.settings.codCap);
+  const blocked = overCap || (b.codAvailable === false ? 'cod_not_offered' : null);
   const o = {
     id: id(), userId: u.id, platform: b.platform, flow: b.flow, items, total: total || 0,
     lineItems: Array.isArray(b.lineItems) ? b.lineItems : null, restaurant: b.restaurant || null,
     source: b.source === 'voice' ? 'voice' : 'form',
-    cap: db.settings.codCap, status: blocked ? 'blocked' : 'pending_approval', createdAt: now(),
+    swiggy: b.swiggy || null, // a real Swiggy cart: address, restaurant and price breakdown
+    cap: db.settings.codCap, status: blocked ? 'blocked' : 'pending_approval', blockReason: blocked, createdAt: now(),
   };
   db.orders.push(o);
   logEvent(u.id, 'order_request', { platform: o.platform, orderId: o.id });
-  if (blocked) addRun({ userId: u.id, orderId: o.id, platform: o.platform, flow: o.flow, outcome: 'failed', failure: blocked, total: o.total, codOffered: null, notes: `Total ₹${o.total} is over the ₹${o.cap} COD cap` });
+  if (blocked) addRun({
+    userId: u.id, orderId: o.id, platform: o.platform, flow: o.flow, outcome: 'failed', failure: blocked, total: o.total,
+    codOffered: blocked === 'cod_not_offered' ? false : null,
+    notes: blocked === 'cod_not_offered' ? 'Swiggy did not offer cash on delivery for this cart' : `Total ₹${o.total} is over the ₹${o.cap} COD cap`,
+  });
+  return o;
+}
+
+// Places an approved real Swiggy order. Status goes placing -> placed | failed | blocked | unknown.
+async function placeOnSwiggy(o) {
+  const link = linkFor(o.userId, 'swiggy');
+  need(link?.status === 'linked' && link.tokens, 'Log in with Swiggy again first');
+  o.status = 'placing'; // set before any await, so a second Approve tap is refused
+  save();
+  let r, mcp;
+  try {
+    mcp = await sw.connect(link);
+    r = await placeCashOrder(mcp, o, db.settings.codCap);
+  } catch (e) {
+    // Failed before place_food_order was reached (login, network, reading the cart).
+    r = { ok: false, failure: /login|token|401/i.test(e.message) ? 'login_failed' : 'other', message: e.message };
+  } finally {
+    await mcp?.close().catch(() => {});
+  }
+  const run = { userId: o.userId, orderId: o.id, platform: 'swiggy', flow: o.flow, total: o.total };
+  if (r.ok) {
+    Object.assign(o, { status: 'placed', placedAt: now(), swiggyOrderId: r.swiggyOrderId, swiggyReply: r.raw });
+    addRun({ ...run, outcome: 'success', codOffered: true, notes: `Placed on Swiggy${r.swiggyOrderId ? `, order ${r.swiggyOrderId}` : ''}` });
+    logEvent(o.userId, 'order_placed', { platform: 'swiggy', orderId: o.id, items: o.items });
+  } else {
+    o.status = r.placed === 'unknown' ? 'unknown' : ['cod_over_cap', 'cod_not_offered'].includes(r.failure) ? 'blocked' : 'failed';
+    Object.assign(o, { failReason: r.message, blockReason: r.failure, swiggyReply: r.raw || null });
+    addRun({ ...run, outcome: 'failed', failure: r.failure, codOffered: r.failure === 'cod_not_offered' ? false : null, notes: r.message });
+  }
   return o;
 }
 
@@ -385,10 +489,41 @@ function serveStatic(req, res) {
   });
 }
 
+// Browser redirects for Swiggy's login. Not JSON: the user's browser is sent to Swiggy and back.
+async function swiggyOAuth(url, res) {
+  const back = (params) => { res.writeHead(302, { Location: `/#setup?${new URLSearchParams(params)}` }); res.end(); };
+  try {
+    if (url.pathname === '/oauth/swiggy/start') {
+      const u = getUser(url.searchParams.get('userId'));
+      res.writeHead(302, { Location: await sw.loginUrl(u.id) });
+      return res.end();
+    }
+    if (url.pathname === '/oauth/swiggy/callback') {
+      const err = url.searchParams.get('error');
+      if (err) return back({ swiggy_error: url.searchParams.get('error_description') || err });
+      const { userId, tokens } = await sw.finishLogin(url.searchParams.get('code'), url.searchParams.get('state'));
+      let l = linkFor(userId, 'swiggy');
+      if (!l) { l = { userId, platform: 'swiggy' }; db.links.push(l); }
+      Object.assign(l, { status: 'linked', linkedAt: now(), disconnectedAt: null, tokens });
+      logEvent(userId, 'link', { platform: 'swiggy' });
+      save();
+      return back({ linked: 'swiggy' });
+    }
+    send(res, 404, { error: 'Not found' });
+  } catch (e) {
+    console.error('Swiggy login:', e.message);
+    back({ swiggy_error: e.message });
+  }
+}
+
+let sw;
+const sessions = new Map(); // userId -> ChatGPT conversation with Swiggy, kept in memory for 30 min
 export function createServer() {
   load();
+  sw = swiggy(db, save, PUBLIC_URL);
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
+    if (url.pathname.startsWith('/oauth/')) return swiggyOAuth(url, res);
     if (!url.pathname.startsWith('/api/')) return serveStatic(req, res);
     const key = `${req.method} ${url.pathname}`;
     const handler = routes[key];

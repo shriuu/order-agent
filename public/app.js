@@ -36,7 +36,7 @@ const guard = (fn) => async (e) => { e?.preventDefault?.(); try { await fn(e); }
 // ---------- tabs ----------
 
 const views = { setup: renderSetup, order: renderOrder, dashboard: renderDashboard };
-function currentTab() { const h = location.hash.slice(1); return views[h] ? h : 'setup'; }
+function currentTab() { const h = location.hash.slice(1).split('?')[0]; return views[h] ? h : 'setup'; }
 async function show() {
   // Order needs an account; Setup and Dashboard don't.
   const tab = !userId && currentTab() === 'order' ? 'setup' : currentTab();
@@ -87,7 +87,7 @@ async function renderSetup(el) {
         <div class="platform">
           <div>
             <strong>${NAMES[l.platform]}</strong>
-            ${l.status === 'linked' ? `<span class="badge b-ok">Linked</span><div class="note">Since ${when(l.linkedAt)}</div>`
+            ${l.status === 'linked' ? `<span class="badge b-ok">Linked</span><div class="note">Since ${when(l.linkedAt)}${l.real ? ` · logged in with Swiggy · <a href="#" data-check="${l.platform}">Test connection</a>` : ''}</div>`
               : l.status === 'disconnected' ? `<span class="badge b-bad">Disconnected</span><div class="note">${when(l.disconnectedAt)}</div>`
               : `<span class="badge">Not linked</span>`}
           </div>
@@ -104,6 +104,12 @@ async function renderSetup(el) {
   $('#signout').onclick = () => { userId = null; me = null; wizard.active = false; store.set('userId', null); renderSetup(el); };
   $('#link-all')?.addEventListener('click', () => { wizard.active = true; wizard.skipped = []; wizard.only = null; renderSetup(el); });
   el.querySelectorAll('[data-start]').forEach(b => b.onclick = () => { wizard.active = true; wizard.skipped = []; wizard.only = b.dataset.start; renderSetup(el); });
+  el.querySelectorAll('[data-check]').forEach(a => a.onclick = guard(async () => {
+    a.textContent = 'Checking…';
+    const r = await api('GET', '/api/swiggy/check?userId=' + encodeURIComponent(userId));
+    a.textContent = `Working: Swiggy offers ${r.tools.length} tools`;
+  }));
+  $('#w-swiggy')?.addEventListener('click', () => { location.href = '/oauth/swiggy/start?userId=' + encodeURIComponent(userId); });
   $('#w-skip')?.addEventListener('click', () => { wizard.skipped.push(wizardStep()); renderSetup(el); });
   $('#w-close')?.addEventListener('click', () => { wizard.active = false; renderSetup(el); });
   $('#w-done')?.addEventListener('click', guard(async () => {
@@ -159,6 +165,23 @@ function linkWizard() {
   }
 
   const n = order.indexOf(step) + 1;
+  if (step === 'swiggy') {
+    return `
+    <div class="card wizard">
+      <ol class="steps">${dots}</ol>
+      <h3>Step ${n} of ${order.length}: link Swiggy</h3>
+      <ol class="howto">
+        <li>Tap <strong>Log in with Swiggy</strong>. Swiggy's own login page opens.</li>
+        <li>Enter your phone number <strong>+91 ${esc(me.user.phone)}</strong> and the OTP Swiggy texts you.</li>
+        <li>Approve access. You come straight back here, linked.</li>
+      </ol>
+      <p class="note">Your OTP goes only to Swiggy. We receive a login key that you can cancel any time with Disconnect.</p>
+      <div class="row">
+        <button class="primary" id="w-swiggy">Log in with Swiggy</button>
+        <button id="w-skip">Skip for now</button>
+      </div>
+    </div>`;
+  }
   return `
     <div class="card wizard">
       <ol class="steps">${dots}</ol>
@@ -182,6 +205,7 @@ const STATUS = {
   pending_approval: ['Waiting for your approval', 'b-warn'], blocked: ['Blocked: over COD cap', 'b-bad'],
   approved: ['Approved, record the result', 'b-warn'], rejected: ['Rejected', ''],
   placed: ['Placed', 'b-ok'], failed: ['Failed', 'b-bad'],
+  placing: ['Placing on Swiggy…', 'b-warn'], unknown: ['Check the Swiggy app', 'b-warn'],
 };
 
 const ago = (iso) => {
@@ -235,7 +259,9 @@ async function renderOrder(el) {
             <span class="badge ${cls}">${label}</span>
           </div>
           <div>${esc(o.items)}</div>
-          <div class="note">${when(o.createdAt)}${o.source === 'voice' ? ' · by voice' : ''}${o.status === 'blocked' ? ` · cap was ${rupees(o.cap)}` : ''}</div>
+          <div class="note">${when(o.createdAt)}${o.source === 'voice' ? ' · by voice' : ''}${o.swiggy ? ` · real Swiggy cart · deliver to ${esc(o.swiggy.addressLabel)}` : ''}${o.status === 'blocked' && !o.failReason ? ` · cap was ${rupees(o.cap)}` : ''}</div>
+          ${o.status === 'placed' && o.swiggy ? `<div class="b-ok">Placed on Swiggy${o.swiggyOrderId ? ` · order ${esc(o.swiggyOrderId)}` : ''}. Pay ${rupees(o.total)} in cash on delivery.</div>` : ''}
+          ${o.failReason ? `<div class="${o.status === 'unknown' ? 'b-warn' : 'b-bad'}">${esc(o.failReason)}</div>` : ''}
           ${o.status === 'pending_approval' ? `
             <div class="row" style="margin-top:8px">
               <button class="primary" data-decide="approve" data-id="${o.id}">Approve</button>
@@ -271,7 +297,16 @@ async function renderOrder(el) {
     renderOrder(el);
   }));
   el.querySelectorAll('[data-decide]').forEach(b => b.onclick = guard(async () => {
-    await api('POST', '/api/orders/decide', { userId, orderId: b.dataset.id, decision: b.dataset.decide });
+    const o = orders.find(x => x.id === b.dataset.id);
+    const real = o?.swiggy && b.dataset.decide === 'approve';
+    if (real && !confirm(`Place a REAL Swiggy order?\n\n${o.items}\n${rupees(o.total)}, cash on delivery\nDeliver to: ${o.swiggy.addressLabel}\n\nA delivery partner will come. Keep cash ready.`)) return;
+    if (real) { b.disabled = true; b.textContent = 'Placing on Swiggy…'; }
+    const out = await api('POST', '/api/orders/decide', { userId, orderId: b.dataset.id, decision: b.dataset.decide });
+    if (real) {
+      const ok = out.status === 'placed';
+      toast(ok ? 'Order placed on Swiggy' : out.failReason || 'Order not placed', !ok);
+      speak(ok ? `Your order is placed. Please keep ${out.total} rupees cash ready.` : out.failReason);
+    }
     renderOrder(el);
   }));
   el.querySelectorAll('form.result').forEach(form => {
@@ -301,7 +336,7 @@ function voicePanel() {
     <div class="card voice">
       <div class="row spread">
         <h3 style="margin:0">Voice order</h3>
-        <span class="note">Speech: ${useSarvam() ? 'Sarvam' : 'browser'} · ${meta.agentEngine === 'claude' ? 'Understood by Claude' : 'Offline parser (no API key)'} ·
+        <span class="note">Speech: ${useSarvam() ? 'Sarvam' : 'browser'} · ${linked().includes('swiggy') && me?.links.find(l => l.platform === 'swiggy')?.real && meta.agentEngine === 'openai' ? 'Live Swiggy, via ChatGPT' : meta.agentEngine === 'claude' ? 'Understood by Claude' : meta.agentEngine === 'openai' ? 'ChatGPT' : 'Offline parser (no API key)'} ·
           <a href="#" id="mute">${voice.muted ? 'Sound off' : 'Sound on'}</a></span>
       </div>
       <p class="note">Say the platform, what you want and how many, and the cart total. Or ask a question, like "what's my COD limit?"</p>
@@ -309,7 +344,23 @@ function voicePanel() {
         ${voice.history.length ? voice.history.slice(-8).map(h => `<div class="bubble ${h.role}">${esc(h.text)}</div>`).join('')
           : '<div class="note">Try: "2 chicken biryani and a raita from Meghana on Swiggy, total 600"</div>'}
       </div>
-      ${hasDraft ? `
+      ${hasDraft && d.real ? `
+        <div class="draft">
+          <div class="row spread"><strong>Real Swiggy cart</strong><span class="note">Deliver to ${esc(d.addressLabel)}</span></div>
+          <div>${esc(d.restaurant)}</div>
+          <table class="cart">
+            ${d.items.map(i => `<tr><td>${esc(i.name)} × ${i.quantity}</td><td>${rupees(i.price)}</td></tr>`).join('')}
+            <tr class="note"><td>Item total</td><td>${rupees(d.itemTotal)}</td></tr>
+            <tr class="note"><td>Delivery, taxes and charges</td><td>${rupees(d.fees)}</td></tr>
+            <tr><th>To pay (cash on delivery)</th><th>${rupees(d.total)}</th></tr>
+          </table>
+          ${d.total > meta.settings.codCap ? `<p class="b-bad" style="margin:6px 0 0">Over your ${rupees(meta.settings.codCap)} COD limit: it will be blocked.</p>` : ''}
+          ${d.codAvailable ? '' : '<p class="b-bad" style="margin:6px 0 0">Swiggy is not offering cash on delivery for this cart: it will be blocked.</p>'}
+          <div class="row" style="margin-top:8px">
+            <button class="primary" id="v-send">Send for approval</button>
+            <button id="v-clear">Clear</button>
+          </div>
+        </div>` : hasDraft ? `
         <div class="draft">
           <div><strong>${d.platform ? NAMES[d.platform] : 'Platform?'}</strong> · ${FLOW_NAMES[d.flow] || 'Search & order'}${d.restaurant ? ' · ' + esc(d.restaurant) : ''}</div>
           ${d.items?.length ? `<ul>${d.items.map(i => `<li>${esc(i.name)} × ${i.quantity}</li>`).join('')}</ul>` : ''}
@@ -418,7 +469,12 @@ async function sendToAgent(text, el) {
   text = text.trim();
   if (!text) return;
   voice.history.push({ role: 'user', text });
-  const out = await api('POST', '/api/agent', { userId, text, draft: voice.draft, history: voice.history.slice(-6) });
+  // Real Swiggy turns take several tool calls; show that something is happening.
+  voice.history.push({ role: 'agent', text: 'Checking Swiggy…', pending: true });
+  await renderOrder(el);
+  let out;
+  try { out = await api('POST', '/api/agent', { userId, text, draft: voice.draft, history: voice.history.filter(h => !h.pending).slice(-6) }); }
+  finally { voice.history = voice.history.filter(h => !h.pending); }
   voice.draft = out.draft;
   if (out.reply) { voice.history.push({ role: 'agent', text: out.reply }); speak(out.reply); }
   if (out.order) toast(out.order.status === 'blocked' ? 'Blocked: over COD cap' : 'Sent for approval', out.order.status === 'blocked');
@@ -613,5 +669,12 @@ async function renderDashboard(el, justTried = false) {
   userId = store.get('userId');
   if (userId) { try { await api('POST', '/api/open', { userId }); } catch {} }
   await refreshMe();
+  // Back from Swiggy's login page: #setup?linked=swiggy or #setup?swiggy_error=...
+  const back = new URLSearchParams(location.hash.split('?')[1] || '');
+  if (back.has('linked') || back.has('swiggy_error')) {
+    history.replaceState(null, '', '#setup');
+    if (back.has('linked')) { wizard.active = true; toast('Swiggy linked'); }
+    else toast('Swiggy login failed: ' + back.get('swiggy_error'), true);
+  }
   show();
 })();
